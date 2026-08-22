@@ -1,0 +1,4 @@
+# Keep the diagnostic resident after DriverKit detaches its loader server.
+WIRE
+DETACH
+

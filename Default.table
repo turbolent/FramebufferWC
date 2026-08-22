@@ -1,0 +1,8 @@
+"Title" = "Framebuffer Write Combining";
+"Family" = "System";
+"Location" = "";
+"Instance" = "0";
+"Driver Name" = "FramebufferWC";
+"Class Names" = "FramebufferWC";
+"Version" = "0.27";
+"Driver Version" = "FramebufferWC 0.27";

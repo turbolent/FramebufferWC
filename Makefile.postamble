@@ -1,0 +1,10 @@
+-include $(LOCALMAKEFILEDIR)/Makefile.local_postamble
+include /NextDeveloper/Makefiles/driverkit/Makefile.bundle_postamble
+
+framebufferwc-control: framebufferwc-control.m \
+		FramebufferWC_reloc.tproj/FramebufferWCControl.h
+	$(CC) -O2 -Wall -ObjC -IFramebufferWC_reloc.tproj \
+		-o $@ framebufferwc-control.m -lDriver
+
+vbe-cache-patch: vbe-cache-patch.c
+	$(CC) -O2 -Wall -o $@ vbe-cache-patch.c

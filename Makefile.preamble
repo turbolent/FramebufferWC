@@ -1,0 +1,5 @@
+LOCALMAKEFILEDIR = /LocalDeveloper/Makefiles/driverkit
+LOCALMAKEFILE = Makefile.local_preamble
+OTHER_GARBAGE = framebufferwc-control framebufferwc-control.o \
+	vbe-cache-patch vbe-cache-patch.o
+-include $(LOCALMAKEFILEDIR)/$(LOCALMAKEFILE)
