@@ -6,6 +6,9 @@ typedef unsigned long long MTRRU64;
 
 #define MTRR_TYPE_UC 0U
 #define MTRR_TYPE_WC 1U
+#define MTRR_TYPE_WT 4U
+#define MTRR_TYPE_WP 5U
+#define MTRR_TYPE_WB 6U
 
 #define MTRR_CAP_MSR 0x000000feU
 #define MTRR_PHYSBASE0_MSR 0x00000200U
@@ -15,6 +18,7 @@ typedef unsigned long long MTRRU64;
 #define MTRR_CAP_VARIABLE_COUNT_MASK 0xffULL
 #define MTRR_CAP_WRITE_COMBINING (1ULL << 10)
 #define MTRR_DEF_TYPE_ENABLE (1ULL << 11)
+#define MTRR_DEF_TYPE_FIXED_ENABLE (1ULL << 10)
 #define MTRR_PHYSMASK_VALID (1ULL << 11)
 #define MTRR_REPACK_MAX_RANGES 32U
 
@@ -46,29 +50,30 @@ typedef enum {
 } MTRRRequestStatus;
 
 typedef enum {
-    MTRR_REPACK_VALID = 0,
-    MTRR_REPACK_SOURCE_INVALID = 1,
-    MTRR_REPACK_SOURCE_NOT_UC = 2,
-    MTRR_REPACK_REQUEST_INVALID = 3,
-    MTRR_REPACK_REQUEST_NOT_CONTAINED = 4,
-    MTRR_REPACK_TOO_MANY_RANGES = 5,
-    MTRR_REPACK_BUILD_FAILED = 6,
-    MTRR_REPACK_VERIFICATION_FAILED = 7
-} MTRRRepackStatus;
+    MTRR_WC_VALID = 0,
+    MTRR_WC_ALREADY_SET,
+    MTRR_WC_INVALID_REQUEST,
+    MTRR_WC_INVALID_LAYOUT,
+    MTRR_WC_LOW_MEMORY,
+    MTRR_WC_NO_SPACE,
+    MTRR_WC_VERIFICATION_FAILED
+} MTRRWCStatus;
 
+/* Complete register table, retaining the indices of unaffected entries. */
 typedef struct {
-    MTRRU64 base;
-    MTRRU64 size;
-    MTRRU64 end;
-    MTRRU64 rawBase;
-    MTRRU64 rawMask;
-    unsigned type;
-} MTRRPlannedRange;
+    MTRRRange ranges[MTRR_REPACK_MAX_RANGES];
+    unsigned changedCount;
+    unsigned requiredCount;
+} MTRRWCPlan;
 
-typedef struct {
-    MTRRPlannedRange ranges[MTRR_REPACK_MAX_RANGES];
-    unsigned rangeCount;
-} MTRRRepackPlan;
+MTRRWCStatus MTRRCorePlanFramebufferWC(const MTRRRange *ranges,
+                                       unsigned rangeCount,
+                                       MTRRU64 requestBase,
+                                       MTRRU64 requestSize,
+                                       unsigned physicalAddressBits,
+                                       int fixedRangesEnabled,
+                                       MTRRWCPlan *plan);
+const char *MTRRCoreWCStatusName(MTRRWCStatus status);
 
 MTRRRangeStatus MTRRCoreDecodeRange(MTRRU64 rawBase,
                                     MTRRU64 rawMask,
@@ -87,11 +92,4 @@ MTRRRequestStatus MTRRCoreBuildRange(MTRRU64 base,
                                      unsigned physicalAddressBits,
                                      MTRRU64 *rawBase,
                                      MTRRU64 *rawMask);
-MTRRRepackStatus MTRRCorePlanUCRepack(const MTRRRange *source,
-                                      MTRRU64 requestBase,
-                                      MTRRU64 requestSize,
-                                      unsigned physicalAddressBits,
-                                      MTRRRepackPlan *plan);
-const char *MTRRCoreRepackStatusName(MTRRRepackStatus status);
-
 #endif

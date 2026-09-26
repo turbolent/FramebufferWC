@@ -4,5 +4,5 @@
 "Instance" = "0";
 "Driver Name" = "FramebufferWC";
 "Class Names" = "FramebufferWC";
-"Version" = "0.27";
-"Driver Version" = "FramebufferWC 0.27";
+"Version" = "0.28";
+"Driver Version" = "FramebufferWC 0.28";

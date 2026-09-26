@@ -8,7 +8,7 @@
 #import "MTRRX86.h"
 #import <string.h>
 
-#define FRAMEBUFFERWC_VERSION "0.27"
+#define FRAMEBUFFERWC_VERSION "0.28"
 #define FRAMEBUFFERWC_MAX_VARIABLE_RANGES 32U
 #define FRAMEBUFFERWC_MAX_VBE_MODES 256U
 #define FRAMEBUFFERWC_VBE_DESCRIPTION_SIZE 512U
@@ -21,10 +21,11 @@ extern machine_info_data_t machine_info;
 static MTRRRange savedRanges[FRAMEBUFFERWC_MAX_VARIABLE_RANGES];
 static MTRRX86VariableRangeWrite writes[FRAMEBUFFERWC_MAX_VARIABLE_RANGES];
 static MTRRX86VariableRangeWrite snapshots[FRAMEBUFFERWC_MAX_VARIABLE_RANGES];
-static MTRRRepackPlan repackPlan;
-static unsigned freeIndices[FRAMEBUFFERWC_MAX_VARIABLE_RANGES];
+static MTRRX86VariableRangeWrite changedWrites[FRAMEBUFFERWC_MAX_VARIABLE_RANGES];
+static MTRRWCPlan wcPlan;
 static MTRRU64 toggleRawDefault;
 static unsigned toggleWriteCount;
+static unsigned toggleRangeCount;
 static int toggleAvailable;
 static FramebufferWC *registeredControl;
 static unsigned char vbeDescription[FRAMEBUFFERWC_VBE_DESCRIPTION_SIZE];
@@ -267,11 +268,29 @@ currentToggleState(void)
         return FRAMEBUFFERWC_STATE_UNAVAILABLE;
     if (MTRRX86ReadMSR(MTRR_DEF_TYPE_MSR) != toggleRawDefault)
         return FRAMEBUFFERWC_STATE_INCONSISTENT;
-    if (variableWritesMatch(writes, toggleWriteCount, 0))
+    if (variableWritesMatch(writes, toggleRangeCount, 0))
         return FRAMEBUFFERWC_STATE_ON;
-    if (variableWritesMatch(snapshots, toggleWriteCount, 0))
+    if (variableWritesMatch(snapshots, toggleRangeCount, 0))
         return FRAMEBUFFERWC_STATE_OFF;
     return FRAMEBUFFERWC_STATE_INCONSISTENT;
+}
+
+static void
+programChangedRanges(const MTRRX86VariableRangeWrite *target,
+                      const MTRRX86VariableRangeWrite *other,
+                      unsigned count, MTRRU64 rawDefault)
+{
+    unsigned index;
+    unsigned changedCount;
+
+    changedCount = 0;
+    for (index = 0; index < count; index++) {
+        if (target[index].rawBase != other[index].rawBase ||
+            target[index].rawMask != other[index].rawMask)
+            changedWrites[changedCount++] = target[index];
+    }
+    if (changedCount != 0)
+        MTRRX86ProgramVariableRanges(changedWrites, changedCount, rawDefault);
 }
 
 static int
@@ -293,7 +312,7 @@ programAndVerify(const MTRRX86VariableRangeWrite *target,
         return 0;
     }
 
-    MTRRX86ProgramVariableRanges(target, writeCount, rawDefault);
+    programChangedRanges(target, expectedCurrent, writeCount, rawDefault);
     currentDefault = MTRRX86ReadMSR(MTRR_DEF_TYPE_MSR);
     if (currentDefault == rawDefault &&
         variableWritesMatch(target, writeCount, "readback")) {
@@ -303,7 +322,7 @@ programAndVerify(const MTRRX86VariableRangeWrite *target,
         IOLog("FramebufferWC: IA32_MTRR_DEF_TYPE readback mismatch\n");
 
     IOLog("FramebufferWC: readback failed; restoring preflight MTRR values\n");
-    MTRRX86ProgramVariableRanges(expectedCurrent, writeCount, rawDefault);
+    programChangedRanges(expectedCurrent, target, writeCount, rawDefault);
     currentDefault = MTRRX86ReadMSR(MTRR_DEF_TYPE_MSR);
     if (currentDefault == rawDefault &&
         variableWritesMatch(expectedCurrent, writeCount, "rollback"))
@@ -321,32 +340,22 @@ configureFramebufferWC(void)
     MTRRCPUIDResult extended;
     MTRRCPUIDResult addressWidth;
     MTRRRange *range;
-    MTRRRepackStatus repackStatus;
+    MTRRWCStatus wcStatus;
     MTRRU64 rawCapability;
     MTRRU64 rawDefault;
     MTRRU64 rawBase;
     MTRRU64 rawMask;
     MTRRU64 requestBase;
     MTRRU64 requestSize;
-    MTRRU64 requestEnd;
-    MTRRU64 candidateBase;
-    MTRRU64 candidateMask;
     MTRRRequestStatus requestStatus;
     unsigned physicalAddressBits;
     unsigned index;
     unsigned variableCount;
-    unsigned freeCount;
-    unsigned freePosition;
-    unsigned replaceIndex;
-    unsigned containingUCCount;
-    unsigned overlapCount;
-    unsigned exactWCCount;
-    unsigned plannedIndex;
-    unsigned assignedIndex;
     unsigned writeCount;
 
     toggleAvailable = 0;
     toggleWriteCount = 0;
+    toggleRangeCount = 0;
     toggleRawDefault = 0;
     IOLog("FramebufferWC %s: automatic VBE discovery\n",
           FRAMEBUFFERWC_VERSION);
@@ -404,138 +413,75 @@ configureFramebufferWC(void)
         return NO;
     requestStatus = MTRRCoreValidateRequest(requestBase, requestSize,
                                             physicalAddressBits,
-                                            &requestEnd);
+                                            0);
     if (requestStatus != MTRR_REQUEST_VALID) {
         IOLog("FramebufferWC: discovered VBE range is invalid: %s\n",
               MTRRCoreRequestStatusName(requestStatus));
         return NO;
     }
 
-    freeCount = 0;
-    replaceIndex = variableCount;
-    containingUCCount = 0;
-    overlapCount = 0;
-    exactWCCount = 0;
     for (index = 0; index < variableCount; index++) {
         rawBase = MTRRX86ReadMSR(MTRR_PHYSBASE0_MSR + index * 2U);
         rawMask = MTRRX86ReadMSR(MTRR_PHYSMASK0_MSR + index * 2U);
         range = &savedRanges[index];
         MTRRCoreDecodeRange(rawBase, rawMask, physicalAddressBits, range);
-        if (range->status == MTRR_RANGE_UNUSED) {
-            freeIndices[freeCount++] = index;
-            continue;
-        }
-        if (range->status != MTRR_RANGE_VALID) {
-            IOLog("FramebufferWC: MTRR #%u cannot be assessed safely; "
-                  "no changes made\n", index);
-            return NO;
-        }
-        if (!MTRRCoreRangesOverlap(requestBase, requestEnd,
-                                   range->base, range->end))
-            continue;
-        overlapCount++;
-        if (range->type == MTRR_TYPE_UC &&
-            range->base <= requestBase && range->end >= requestEnd) {
-            replaceIndex = index;
-            containingUCCount++;
-        }
-        if (range->type == MTRR_TYPE_WC && range->base == requestBase &&
-            range->size == requestSize)
-            exactWCCount++;
     }
-
-    if (exactWCCount == 1U && overlapCount == 1U) {
+    wcStatus = MTRRCorePlanFramebufferWC(savedRanges, variableCount,
+                                        requestBase, requestSize,
+                                        physicalAddressBits,
+                                        (rawDefault & MTRR_DEF_TYPE_FIXED_ENABLE) != 0,
+                                        &wcPlan);
+    if (wcStatus == MTRR_WC_ALREADY_SET) {
         IOLog("FramebufferWC: VBE LFB is already write-combined\n");
         return YES;
     }
-    if (overlapCount != 0U &&
-        (containingUCCount != 1U || overlapCount != 1U)) {
-        IOLog("FramebufferWC: framebuffer MTRR layout is ambiguous; "
-              "no changes made\n");
+    if (wcStatus != MTRR_WC_VALID) {
+        IOLog("FramebufferWC: %s; no changes made\n",
+              MTRRCoreWCStatusName(wcStatus));
+        if (wcStatus == MTRR_WC_NO_SPACE)
+            IOLog("FramebufferWC: partition needs %u entries; CPU has %u\n",
+                  wcPlan.requiredCount, variableCount);
+        IOLog("FramebufferWC: physical bits=%u default=0x%08x%08x\n",
+              physicalAddressBits, high32(rawDefault), low32(rawDefault));
+        for (index = 0; index < variableCount; index++) {
+            range = &savedRanges[index];
+            IOLog("FramebufferWC: MTRR #%u raw base=%08x%08x mask=%08x%08x\n",
+                  index, high32(range->rawBase), low32(range->rawBase),
+                  high32(range->rawMask), low32(range->rawMask));
+            if (range->status == MTRR_RANGE_VALID)
+                IOLog("FramebufferWC:   type=%u base=%08x%08x size=%08x%08x\n",
+                      range->type, high32(range->base), low32(range->base),
+                      high32(range->size), low32(range->size));
+        }
+        return NO;
+    }
+    /* Preflight, readback and runtime toggles check the complete table: the
+     * partition also depends on entries whose register values did not change.
+     */
+    writeCount = variableCount;
+    for (index = 0; index < writeCount; index++) {
+        writes[index].index = index;
+        writes[index].rawBase = wcPlan.ranges[index].rawBase;
+        writes[index].rawMask = wcPlan.ranges[index].rawMask;
+        snapshots[index].index = index;
+        snapshots[index].rawBase = savedRanges[index].rawBase;
+        snapshots[index].rawMask = savedRanges[index].rawMask;
+    }
+    IOLog("FramebufferWC: verified partition uses %u/%u entries; changed=%u\n",
+          wcPlan.requiredCount, variableCount, wcPlan.changedCount);
+    if (!programAndVerify(writes, snapshots, writeCount, rawDefault)) {
+        IOLog("FramebufferWC: WC partition was not retained\n");
         return NO;
     }
 
-    if (containingUCCount == 1U) {
-        repackStatus = MTRRCorePlanUCRepack(&savedRanges[replaceIndex],
-                                            requestBase, requestSize,
-                                            physicalAddressBits,
-                                            &repackPlan);
-        if (repackStatus != MTRR_REPACK_VALID) {
-            IOLog("FramebufferWC: automatic UC repack is unsafe: %s\n",
-                  MTRRCoreRepackStatusName(repackStatus));
-            return NO;
-        }
-        for (index = 0; index < variableCount; index++) {
-            if (index == replaceIndex ||
-                savedRanges[index].status == MTRR_RANGE_UNUSED)
-                continue;
-            if (MTRRCoreRangesOverlap(savedRanges[replaceIndex].base,
-                                      savedRanges[replaceIndex].end,
-                                      savedRanges[index].base,
-                                      savedRanges[index].end)) {
-                IOLog("FramebufferWC: containing UC range overlaps another "
-                      "MTRR; no changes made\n");
-                return NO;
-            }
-        }
-        if (repackPlan.rangeCount > freeCount + 1U) {
-            IOLog("FramebufferWC: automatic repack needs %u entries; only %u "
-                  "are available\n", repackPlan.rangeCount, freeCount + 1U);
-            return NO;
-        }
-
-        freePosition = 0;
-        writeCount = 0;
-        for (plannedIndex = 0; plannedIndex < repackPlan.rangeCount;
-             plannedIndex++) {
-            MTRRPlannedRange *planned;
-
-            planned = &repackPlan.ranges[plannedIndex];
-            assignedIndex = planned->type == MTRR_TYPE_WC ?
-                            replaceIndex : freeIndices[freePosition++];
-            writes[writeCount].index = assignedIndex;
-            writes[writeCount].rawBase = planned->rawBase;
-            writes[writeCount].rawMask = planned->rawMask;
-            snapshots[writeCount].index = assignedIndex;
-            snapshots[writeCount].rawBase = savedRanges[assignedIndex].rawBase;
-            snapshots[writeCount].rawMask = savedRanges[assignedIndex].rawMask;
-            writeCount++;
-        }
-        if (!programAndVerify(writes, snapshots, writeCount, rawDefault)) {
-            IOLog("FramebufferWC: WC repack was not retained\n");
-            return NO;
-        }
-    } else {
-        if (freeCount == 0) {
-            IOLog("FramebufferWC: no free variable MTRR is available\n");
-            return NO;
-        }
-        requestStatus = MTRRCoreBuildRange(requestBase, requestSize,
-                                           MTRR_TYPE_WC,
-                                           physicalAddressBits,
-                                           &candidateBase, &candidateMask);
-        if (requestStatus != MTRR_REQUEST_VALID)
-            return NO;
-        writes[0].index = freeIndices[0];
-        writes[0].rawBase = candidateBase;
-        writes[0].rawMask = candidateMask;
-        snapshots[0].index = freeIndices[0];
-        snapshots[0].rawBase = savedRanges[freeIndices[0]].rawBase;
-        snapshots[0].rawMask = savedRanges[freeIndices[0]].rawMask;
-        writeCount = 1U;
-        if (!programAndVerify(writes, snapshots, writeCount, rawDefault)) {
-            IOLog("FramebufferWC: WC MTRR was not retained\n");
-            return NO;
-        }
-    }
-
     toggleRawDefault = rawDefault;
-    toggleWriteCount = writeCount;
+    toggleWriteCount = wcPlan.changedCount;
+    toggleRangeCount = writeCount;
     toggleAvailable = 1;
     IOLog("FramebufferWC: ready state=ON base=0x%08x%08x "
           "size=0x%08x%08x entries=%u\n",
           high32(requestBase), low32(requestBase),
-          high32(requestSize), low32(requestSize), writeCount);
+          high32(requestSize), low32(requestSize), toggleWriteCount);
     return YES;
 }
 
@@ -700,7 +646,7 @@ configureFramebufferWC(void)
           currentState == FRAMEBUFFERWC_STATE_ON ? "ON" : "OFF",
           requestedState == FRAMEBUFFERWC_STATE_ON ? "ON" : "OFF");
     succeeded = programAndVerify(target, expectedCurrent,
-                                 toggleWriteCount, toggleRawDefault);
+                                 toggleRangeCount, toggleRawDefault);
     if (succeeded)
         IOLog("FramebufferWC: runtime toggle is now %s\n",
               requestedState == FRAMEBUFFERWC_STATE_ON ? "ON" : "OFF");
