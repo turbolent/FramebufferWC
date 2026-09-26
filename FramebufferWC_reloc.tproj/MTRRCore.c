@@ -200,14 +200,14 @@ placeWCRange(MTRRWCPlan *plan, const unsigned *slots, unsigned slotCount,
  */
 static unsigned
 typesAt(const MTRRRange *ranges, unsigned count, MTRRU64 address,
-         MTRRU64 *next)
+         MTRRU64 *next, MTRRU32 skip)
 {
     unsigned index;
     unsigned types;
 
     types = 0;
     for (index = 0; index < count; index++) {
-        if (ranges[index].status != MTRR_RANGE_VALID)
+        if (ranges[index].status != MTRR_RANGE_VALID || (skip & (1U << index)))
             continue;
         if (ranges[index].base <= address && ranges[index].end >= address)
             types |= 1U << ranges[index].type;
@@ -220,10 +220,40 @@ typesAt(const MTRRRange *ranges, unsigned count, MTRRU64 address,
     return types;
 }
 
+/* Intel SDM, MTRR precedence: UC wins; WB+WT is WT. Other mixed
+ * overlaps have no defined type and must retain their original type set.
+ * The default applies only when no variable range matches.
+ */
+static unsigned
+effectiveTypes(unsigned types, unsigned defaultType)
+{
+    if (types == 0)
+        return 1U << defaultType;
+    if (types & (1U << MTRR_TYPE_UC))
+        return 1U << MTRR_TYPE_UC;
+    if (types == ((1U << MTRR_TYPE_WB) | (1U << MTRR_TYPE_WT)))
+        return 1U << MTRR_TYPE_WT;
+    if ((types & (types - 1U)) == 0)
+        return types;
+    return 0;
+}
+
+static int
+sameEffectiveTypes(unsigned first, unsigned second, unsigned defaultType)
+{
+    unsigned effective;
+
+    if (first == second)
+        return 1;
+    effective = effectiveTypes(first, defaultType);
+    return effective != 0 && effective == effectiveTypes(second, defaultType);
+}
+
 static int
 verifyWCPlan(const MTRRRange *before, unsigned count,
               MTRRU64 requestBase, MTRRU64 requestEnd,
-              unsigned physicalAddressBits, const MTRRWCPlan *plan)
+              unsigned physicalAddressBits, unsigned defaultType,
+              int compareEffective, const MTRRWCPlan *plan)
 {
     MTRRU64 address;
     MTRRU64 next;
@@ -239,12 +269,14 @@ verifyWCPlan(const MTRRRange *before, unsigned count,
             next = requestBase;
         else if (requestEnd >= address)
             next = requestEnd + 1ULL;
-        oldTypes = typesAt(before, count, address, &next);
-        newTypes = typesAt(plan->ranges, count, address, &next);
+        oldTypes = typesAt(before, count, address, &next, 0);
+        newTypes = typesAt(plan->ranges, count, address, &next, 0);
         if (address >= requestBase && address <= requestEnd) {
             if (newTypes != (1U << MTRR_TYPE_WC))
                 return 0;
-        } else if (oldTypes != newTypes) {
+        } else if (oldTypes != newTypes &&
+                   (!compareEffective ||
+                    !sameEffectiveTypes(oldTypes, newTypes, defaultType))) {
             return 0;
         }
         address = next;
@@ -252,13 +284,128 @@ verifyWCPlan(const MTRRRange *before, unsigned count,
     return 1;
 }
 
+/* Emit a page-aligned interval as aligned power-of-two MTRRs. */
+static int
+placeWCInterval(MTRRWCPlan *plan, const unsigned *slots, unsigned slotCount,
+                 unsigned *used, MTRRU64 base, MTRRU64 end,
+                 unsigned types, unsigned physicalAddressBits)
+{
+    MTRRU64 size;
+    unsigned type;
+
+    if (types == 0)
+        return 1;
+    type = 0;
+    while ((1U << type) != types)
+        type++;
+    while (base < end) {
+        size = 0x1000ULL;
+        while ((size << 1) <= end - base &&
+               (base & ((size << 1) - 1ULL)) == 0)
+            size <<= 1;
+        if (!placeWCRange(plan, slots, slotCount, used, base, size, type,
+                           physicalAddressBits))
+            return 0;
+        base += size;
+    }
+    return 1;
+}
+
+/* If exact type-set preservation exhausts the table, rebuild only the
+ * conflicting entries using effective cache types. Retain all other entries
+ * at their original indices. In particular, a default-UC MMIO hole need not
+ * retain either the WB underlay or a redundant explicit UC range.
+ */
+static MTRRWCStatus
+compactWCPlan(const MTRRRange *ranges, unsigned count,
+               MTRRU64 requestBase, MTRRU64 requestEnd,
+               unsigned physicalAddressBits, unsigned defaultType,
+               const unsigned *slots, unsigned slotCount,
+               MTRRU32 conflicts, MTRRWCPlan *plan)
+{
+    MTRRU64 address;
+    MTRRU64 next;
+    MTRRU64 limit;
+    MTRRU64 pendingBase;
+    unsigned pendingTypes;
+    unsigned oldTypes;
+    unsigned keptTypes;
+    unsigned neededTypes;
+    unsigned exactCount;
+    unsigned used;
+    unsigned index;
+
+    exactCount = plan->requiredCount;
+    plan->requiredCount = 0;
+    for (index = 0; index < count; index++) {
+        plan->ranges[index] = ranges[index];
+        if (conflicts & (1U << index)) {
+            MTRRCoreDecodeRange(ranges[index].rawBase,
+                                ranges[index].rawMask & ~MTRR_PHYSMASK_VALID,
+                                physicalAddressBits, &plan->ranges[index]);
+        } else if (ranges[index].status == MTRR_RANGE_VALID) {
+            plan->requiredCount++;
+        }
+    }
+    used = 0;
+    pendingBase = 0;
+    pendingTypes = 0;
+    limit = 1ULL << physicalAddressBits;
+    address = 0;
+    while (address < limit) {
+        next = limit;
+        if (requestBase > address)
+            next = requestBase;
+        else if (requestEnd >= address)
+            next = requestEnd + 1ULL;
+        oldTypes = typesAt(ranges, count, address, &next, 0);
+        keptTypes = typesAt(ranges, count, address, &next, conflicts);
+        neededTypes = 0;
+        if (address >= requestBase && address <= requestEnd) {
+            if (keptTypes != (1U << MTRR_TYPE_WC))
+                neededTypes = 1U << MTRR_TYPE_WC;
+        } else if (!sameEffectiveTypes(oldTypes, keptTypes, defaultType)) {
+            neededTypes = effectiveTypes(oldTypes, defaultType);
+            if (neededTypes == 0 ||
+                effectiveTypes(keptTypes | neededTypes, defaultType) != neededTypes) {
+                plan->requiredCount = exactCount;
+                return MTRR_WC_NO_SPACE;
+            }
+        }
+        if (neededTypes != pendingTypes) {
+            if (!placeWCInterval(plan, slots, slotCount, &used,
+                                  pendingBase, address, pendingTypes,
+                                  physicalAddressBits))
+                return MTRR_WC_VERIFICATION_FAILED;
+            pendingBase = address;
+            pendingTypes = neededTypes;
+        }
+        address = next;
+    }
+    if (!placeWCInterval(plan, slots, slotCount, &used, pendingBase, limit,
+                          pendingTypes, physicalAddressBits))
+        return MTRR_WC_VERIFICATION_FAILED;
+    if (plan->requiredCount > count) {
+        if (plan->requiredCount > exactCount)
+            plan->requiredCount = exactCount;
+        return MTRR_WC_NO_SPACE;
+    }
+    if (!verifyWCPlan(ranges, count, requestBase, requestEnd,
+                       physicalAddressBits, defaultType, 1, plan))
+        return MTRR_WC_VERIFICATION_FAILED;
+    return MTRR_WC_VALID;
+}
+
 MTRRWCStatus
 MTRRCorePlanFramebufferWC(const MTRRRange *ranges, unsigned rangeCount,
                           MTRRU64 requestBase, MTRRU64 requestSize,
                           unsigned physicalAddressBits,
-                          int fixedRangesEnabled, MTRRWCPlan *plan)
+                          int fixedRangesEnabled, unsigned defaultType,
+                          MTRRWCPlan *plan)
 {
     MTRRRange decoded;
+    MTRRWCStatus compactStatus;
+    MTRRU32 conflicts;
     MTRRU64 addressMask;
     MTRRU64 requestEnd;
     MTRRU64 base;
@@ -282,11 +429,13 @@ MTRRCorePlanFramebufferWC(const MTRRRange *ranges, unsigned rangeCount,
     if (fixedRangesEnabled && requestBase < 0x100000ULL)
         return MTRR_WC_LOW_MEMORY;
     if (ranges == 0 || rangeCount == 0 ||
-        rangeCount > MTRR_REPACK_MAX_RANGES || ranges == plan->ranges)
+        rangeCount > MTRR_REPACK_MAX_RANGES || ranges == plan->ranges ||
+        !knownMemoryType(defaultType))
         return MTRR_WC_INVALID_LAYOUT;
     if (!physicalAddressMask(physicalAddressBits, &addressMask))
         return MTRR_WC_INVALID_REQUEST;
     slotCount = 0;
+    conflicts = 0;
     for (index = 0; index < rangeCount; index++) {
         MTRRCoreDecodeRange(ranges[index].rawBase, ranges[index].rawMask,
                             physicalAddressBits, &decoded);
@@ -308,6 +457,7 @@ MTRRCorePlanFramebufferWC(const MTRRRange *ranges, unsigned rangeCount,
                    MTRRCoreRangesOverlap(requestBase, requestEnd,
                                          decoded.base, decoded.end);
         if (conflict) {
+            conflicts |= 1U << index;
             slots[slotCount++] = index;
             plan->ranges[index].rawMask &= ~MTRR_PHYSMASK_VALID;
             plan->ranges[index].status = MTRR_RANGE_UNUSED;
@@ -359,11 +509,17 @@ MTRRCorePlanFramebufferWC(const MTRRRange *ranges, unsigned rangeCount,
         !placeWCRange(plan, slots, slotCount, &used, requestBase, requestSize,
                       MTRR_TYPE_WC, physicalAddressBits))
         return MTRR_WC_VERIFICATION_FAILED;
-    if (plan->requiredCount > rangeCount)
-        return MTRR_WC_NO_SPACE;
-    if (!verifyWCPlan(ranges, rangeCount, requestBase, requestEnd,
-                       physicalAddressBits, plan))
+    if (plan->requiredCount > rangeCount) {
+        compactStatus = compactWCPlan(ranges, rangeCount, requestBase,
+                                      requestEnd, physicalAddressBits,
+                                      defaultType, slots, slotCount,
+                                      conflicts, plan);
+        if (compactStatus != MTRR_WC_VALID)
+            return compactStatus;
+    } else if (!verifyWCPlan(ranges, rangeCount, requestBase, requestEnd,
+                              physicalAddressBits, defaultType, 0, plan)) {
         return MTRR_WC_VERIFICATION_FAILED;
+    }
     for (index = 0; index < rangeCount; index++) {
         if (plan->ranges[index].rawBase != ranges[index].rawBase ||
             plan->ranges[index].rawMask != ranges[index].rawMask)
@@ -387,7 +543,7 @@ MTRRCoreWCStatusName(MTRRWCStatus status)
     case MTRR_WC_LOW_MEMORY:
         return "framebuffer is below 1 MiB and fixed MTRRs are enabled";
     case MTRR_WC_NO_SPACE:
-        return "insufficient variable MTRRs for an exact partition";
+        return "insufficient variable MTRRs for a verified partition";
     case MTRR_WC_VERIFICATION_FAILED:
         return "partition failed cache-type coverage verification";
     default:

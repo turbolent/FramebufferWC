@@ -66,12 +66,14 @@ typedef struct {
     unsigned requiredCount;
 } MTRRWCPlan;
 
+/* defaultType is IA32_MTRR_DEF_TYPE[7:0]; MTRRs must be enabled. */
 MTRRWCStatus MTRRCorePlanFramebufferWC(const MTRRRange *ranges,
                                        unsigned rangeCount,
                                        MTRRU64 requestBase,
                                        MTRRU64 requestSize,
                                        unsigned physicalAddressBits,
                                        int fixedRangesEnabled,
+                                       unsigned defaultType,
                                        MTRRWCPlan *plan);
 const char *MTRRCoreWCStatusName(MTRRWCStatus status);
 

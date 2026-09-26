@@ -8,7 +8,7 @@
 #import "MTRRX86.h"
 #import <string.h>
 
-#define FRAMEBUFFERWC_VERSION "0.28"
+#define FRAMEBUFFERWC_VERSION "0.29"
 #define FRAMEBUFFERWC_MAX_VARIABLE_RANGES 32U
 #define FRAMEBUFFERWC_MAX_VBE_MODES 256U
 #define FRAMEBUFFERWC_VBE_DESCRIPTION_SIZE 512U
@@ -430,6 +430,7 @@ configureFramebufferWC(void)
                                         requestBase, requestSize,
                                         physicalAddressBits,
                                         (rawDefault & MTRR_DEF_TYPE_FIXED_ENABLE) != 0,
+                                        (unsigned)(rawDefault & 0xffULL),
                                         &wcPlan);
     if (wcStatus == MTRR_WC_ALREADY_SET) {
         IOLog("FramebufferWC: VBE LFB is already write-combined\n");
